@@ -1,0 +1,7 @@
+astropy==8.0.1
+numpy==2.5.3
+scipy==1.18.1
+scikit-image==0.26.0
+opencv-python-headless==4.11.0.86
+Pillow==12.3.0
+PyYAML==6.0.3

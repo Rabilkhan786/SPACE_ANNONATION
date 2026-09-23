@@ -1,0 +1,17 @@
+tile_size: 1024
+background_cell_px: 128
+# Quantization fallback is necessary for this uint16 image's 0/1/2 background.
+noise_floor: 0.288675
+detection_smoothing_sigma_px: 1.0
+seed_sigma: 5.0
+grow_sigma: 2.5
+minimum_area_px: 6
+minimum_peak_snr: 3.0
+streak_elongation: 2.5
+streak_min_major_px: 12.0
+ambiguous_elongation_min: 1.6
+faint_review_snr: 7.0
+large_area_review_px: 400
+classes:
+  0: star_blob
+  1: streak_object

@@ -1,0 +1,18 @@
+# Environment
+.venv/
+__pycache__/
+*.pyc
+
+# Confidential / raw data
+data/
+*.fits
+*.fit
+*.fts
+
+# Generated runs
+run_full_inspection/
+run_question1_all10/
+reviews/
+
+# Private submission files
+*.zip
