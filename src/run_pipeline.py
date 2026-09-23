@@ -407,10 +407,8 @@ def export_source(
             (
                 output_dir / "labels" / f"{tile_name}.txt"
             ).write_text(
-                "
-".join(label_rows)
-                + ("
-" if label_rows else ""),
+                "\n".join(label_rows)
+                + ("\n" if label_rows else ""),
                 encoding="utf-8",
             )
 
