@@ -1,591 +1,702 @@
-"""Question 1: inspect FITS, generate reviewable masks, tile and export privately."""
+"""Run Question 1 of the Digantara AI/ML Data Annotation assessment.
+
+The pipeline follows the three required Question 1 stages:
+A1. Inspect FITS imagery and apply justified preprocessing.
+A2. Divide processed imagery into exact 1024 x 1024 tiles without losing data.
+A3. Create two-class pixel masks and YOLO segmentation labels for:
+    0 = star/blob
+    1 = streak/object
+
+The automatic output is a first-pass annotation. Ambiguous, faint, blended, and
+boundary cases are flagged for manual QA before the dataset is treated as final.
+"""
 
 import argparse
 import csv
 import json
 from pathlib import Path
+from typing import Any
 
-import cv2
 import numpy as np
 import yaml
 from PIL import Image
 from scipy import ndimage
-from skimage.segmentation import watershed
 
 from image_ops import (
+    image_statistics,
+    make_display_image,
+    mask_to_polygons,
+    measure_component,
+    overlay_mask,
+    rasterize_polygon,
     read_fits,
-    statistics,
-    sha256,
-    write_json,
-    standardize,
-    display,
-    overlay,
-    measurements,
-    mask_polygons,
-    rasterize,
+    standardize_local_background,
 )
 
+CLASS_NAMES = {
+    0: "star_blob",
+    1: "streak_object",
+}
 
-def write_csv(path, rows, fields=None):
-    with Path(path).open("w", newline="", encoding="utf-8") as stream:
-        writer = csv.DictWriter(stream, fieldnames=fields or list(rows[0]))
+
+def write_json(path: Path, value: Any) -> None:
+    """Write a JSON file using readable indentation."""
+    path.write_text(json.dumps(value, indent=2), encoding="utf-8")
+
+
+def write_csv(
+    path: Path,
+    rows: list[dict[str, Any]],
+    fieldnames: list[str],
+) -> None:
+    """Write a CSV file with a fixed column order."""
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def discover_inputs(path):
+def discover_fits_files(path: Path) -> list[Path]:
+    """Return FITS files from a file path or directory."""
     extensions = {".fits", ".fit", ".fts"}
+
     if path.is_file():
         return [path] if path.suffix.lower() in extensions else []
+
     return sorted(
-        p for p in path.rglob("*") if p.is_file() and p.suffix.lower() in extensions
+        file
+        for file in path.rglob("*")
+        if file.is_file() and file.suffix.lower() in extensions
     )
 
 
-def inspect_source(path, folder):
-    raw, hdu = read_fits(path)
-    info = statistics(raw)
-    info.update(file=path.name, hdu=hdu, sha256=sha256(path))
-    folder.mkdir(parents=True, exist_ok=True)
-    write_json(folder / "statistics.json", info)
-    limits = [
-        info["percentiles"]["1"],
-        max(info["percentiles"]["99.99"], info["percentiles"]["1"] + 1),
+def inspect_source(
+    path: Path,
+    inspection_dir: Path,
+) -> tuple[np.ndarray, dict[str, Any]]:
+    """Inspect one FITS image and save statistics plus representative previews."""
+    image = read_fits(path)
+    info = image_statistics(image)
+    info["file"] = path.name
+
+    inspection_dir.mkdir(parents=True, exist_ok=True)
+
+    lower = info["percentiles"]["1"]
+    upper = max(info["percentiles"]["99.99"], lower + 1.0)
+    info["display_limits"] = [lower, upper]
+
+    display = make_display_image(image, lower, upper)
+
+    overview = Image.fromarray(display)
+    overview.thumbnail((1600, 1200))
+    overview.save(inspection_dir / "overview.png")
+
+    height, width = image.shape
+    crop_size = 512
+    crop_origins = [
+        (0, 0),
+        (
+            max(0, width // 2 - crop_size // 2),
+            max(0, height // 2 - crop_size // 2),
+        ),
+        (
+            max(0, width - crop_size),
+            max(0, height - crop_size),
+        ),
     ]
-    info["display_limits"] = limits
-    # Thumbnails are for navigation; crops retain original pixels.
-    thumb = Image.fromarray(display(raw[::5, ::5], limits))
-    thumb.save(folder / "overview.png")
-    h, w = raw.shape
-    for index, (x, y) in enumerate(
-        [
-            (0, 0),
-            (max(0, w // 2 - 256), max(0, h // 2 - 256)),
-            (max(0, w - 512), max(0, h - 512)),
-        ]
-    ):
-        Image.fromarray(display(raw[y : y + 512, x : x + 512], limits)).save(
-            folder / f"crop_{index}_x{x}_y{y}.png"
+
+    for index, (x0, y0) in enumerate(crop_origins, start=1):
+        crop = display[y0 : y0 + crop_size, x0 : x0 + crop_size]
+        Image.fromarray(crop).save(
+            inspection_dir / f"crop_{index}_x{x0}_y{y0}.png"
         )
-    write_json(folder / "statistics.json", info)
-    return raw, info
+
+    write_json(inspection_dir / "statistics.json", info)
+    return image, info
 
 
-def detect(raw, cfg):
-    """Detect across the original image, then clip the SAME masks into tiles."""
+def _review_reasons(
+    metrics: dict[str, float | int],
+    bounds: tuple[int, int, int, int],
+    image_shape: tuple[int, int],
+    config: dict[str, Any],
+    is_streak: bool,
+) -> list[str]:
+    """Return reasons that make a candidate worth manual review."""
+    x0, y0, x1, y1 = bounds
+    height, width = image_shape
+    review = config["review"]
+    reasons: list[str] = []
+
+    if is_streak:
+        reasons.append("streak_candidate")
+
+    if (
+        review["ambiguous_elongation_min"]
+        <= metrics["elongation"]
+        < config["streak"]["elongation_min"]
+    ):
+        reasons.append("ambiguous_shape")
+
+    if metrics["peak_snr"] < review["faint_peak_snr"]:
+        reasons.append("faint_source")
+
+    if metrics["area_px"] > review["large_area_px"]:
+        reasons.append("large_or_blended")
+
+    tile_size = config["tile_size"]
+    crosses_tile = (
+        y0 // tile_size != (y1 - 1) // tile_size
+        or x0 // tile_size != (x1 - 1) // tile_size
+    )
+    if crosses_tile:
+        reasons.append("tile_crossing")
+
+    if x0 == 0 or y0 == 0 or x1 == width or y1 == height:
+        reasons.append("source_edge")
+
+    if metrics["area_px"] <= 10 or metrics["minor_axis_px"] < 1.5:
+        reasons.append("small_or_impulsive")
+
+    return reasons
+
+
+def detect_candidates(
+    raw: np.ndarray,
+    config: dict[str, Any],
+) -> tuple[np.ndarray, list[dict[str, Any]], dict[str, Any]]:
+    """Detect candidate stars/blobs and streaks on the full source image.
+
+    Detection is performed before tiling so that an object crossing a 1024-pixel
+    tile boundary is measured once, then clipped consistently into output tiles.
+    """
     finite = np.isfinite(raw)
+    if not finite.any():
+        raise ValueError("Image contains no finite pixels.")
+
     work = raw.astype(np.float32)
-    work[~finite] = np.median(work[finite])
-    z, noise_info = standardize(work, cfg["background_cell_px"], cfg["noise_floor"])
-    del work
-    smooth = ndimage.gaussian_filter(
-        z, cfg["detection_smoothing_sigma_px"], mode="reflect"
+    work[~finite] = float(np.median(work[finite]))
+
+    snr, background_info = standardize_local_background(
+        work,
+        config["background_cell_px"],
+        config["noise_floor"],
     )
-    score, smooth_info = standardize(smooth, cfg["background_cell_px"], 0.05)
-    del smooth
-    support = (score >= cfg["grow_sigma"]) & finite
-    seeds = (score >= cfg["seed_sigma"]) & finite
-    del score
-    labels, count = ndimage.label(support, structure=np.ones((3, 3)))
-    del support
-    seed_ids = np.unique(labels[seeds])
-    del seeds
-    allowed = np.zeros(count + 1, bool)
-    allowed[seed_ids] = True
-    allowed[0] = False
-    slices = ndimage.find_objects(labels)
-    instances = np.zeros(raw.shape, np.int32)
-    candidates = []
-    next_id = 1
-    for old_id, sl in enumerate(slices, 1):
-        if sl is None or not allowed[old_id]:
-            continue
-        component = labels[sl] == old_id
-        if component.sum() < cfg["minimum_area_px"]:
-            continue
-        component = ndimage.binary_fill_holes(component) & finite[sl]
-        metric = measurements(component, z[sl], raw[sl])
-        if metric["peak_snr"] < cfg["minimum_peak_snr"]:
-            continue
-        ratio = metric["elongation"]
-        major = metric["major_axis_px"]
-        cls = int(
-            ratio >= cfg["streak_elongation"]
-            and major >= cfg["streak_min_major_px"]
-            and metric["eccentricity"] >= 0.85
-        )
-        reasons = []
-        if cls:
-            reasons.append("streak_candidate")
-        if cfg["ambiguous_elongation_min"] <= ratio < cfg["streak_elongation"]:
-            reasons.append("ambiguous_shape")
-        if metric["peak_snr"] < cfg["faint_review_snr"]:
-            reasons.append("faint_source")
-        if metric["area_px"] > cfg["large_area_review_px"]:
-            reasons.append("large_or_blended")
-        if (
-            sl[0].start // 1024 != (sl[0].stop - 1) // 1024
-            or sl[1].start // 1024 != (sl[1].stop - 1) // 1024
-        ):
-            reasons.append("tile_crossing")
-        if (
-            sl[0].start == 0
-            or sl[1].start == 0
-            or sl[0].stop == raw.shape[0]
-            or sl[1].stop == raw.shape[1]
-        ):
-            reasons.append("source_edge")
-        if metric["area_px"] <= 10 or metric["minor_axis_px"] < 1.5:
-            reasons.append("small_or_impulsive")
-        instances[sl][component] = next_id
-        candidates.append(
-            dict(
-                object_id=next_id,
-                class_id=cls,
-                x0=sl[1].start,
-                y0=sl[0].start,
-                x1=sl[1].stop,
-                y1=sl[0].stop,
-                **metric,
-                review_status="pending",
-                review_reason=";".join(reasons) or "routine",
-                review_note="",
-            )
-        )
-        next_id += 1
-    return instances, candidates, dict(raw=noise_info, smoothed=smooth_info)
 
-
-def apply_corrections(instances, candidates, corrections, source_hash):
-    """Replay explicit review edits. Full-source polygons use pixel coordinates."""
-    if not corrections:
-        return []
-    if corrections["source_sha256"] != source_hash:
-        raise ValueError("Corrections refer to another image")
-    by_id = {r["object_id"]: r for r in candidates}
-    applied = []
-    for edit in corrections["edits"]:
-        operation = edit["action"]
-        oid = int(edit.get("object_id", max(by_id, default=0) + 1))
-        if not edit.get("note", "").strip():
-            raise ValueError("Every correction requires a review note")
-        if operation != "add" and oid not in by_id:
-            raise ValueError("Unknown correction object ID")
-        if operation == "add" and oid in by_id:
-            raise ValueError("New object ID already exists")
-        if operation == "split":
-            if int(edit["class_id"]) not in (0, 1):
-                raise ValueError("Class ID must be 0 or 1")
-            row = by_id[oid]
-            x0, y0, x1, y1 = [int(row[k]) for k in ["x0", "y0", "x1", "y1"]]
-            region = instances[y0:y1, x0:x1]
-            mask = region == oid
-            markers = np.zeros(mask.shape, np.int32)
-            for index, (x, y) in enumerate(edit["seeds_xy"], 1):
-                xx, yy = int(x) - x0, int(y) - y0
-                if (
-                    not (0 <= yy < mask.shape[0] and 0 <= xx < mask.shape[1])
-                    or not mask[yy, xx]
-                ):
-                    raise ValueError("Split seed outside object")
-                if markers[yy, xx]:
-                    raise ValueError("Duplicate split seeds")
-                markers[yy, xx] = index
-            if markers.max() < 2:
-                raise ValueError("Split requires at least two seeds")
-            parts = watershed(-ndimage.distance_transform_edt(mask), markers, mask=mask)
-            child_ids = []
-            for index in range(1, int(markers.max()) + 1):
-                new_id = max(by_id) + 1
-                child = dict(row)
-                child.update(
-                    object_id=new_id,
-                    class_id=int(edit["class_id"]),
-                    review_status="visually_reviewed",
-                    review_note=edit["note"],
-                )
-                by_id[new_id] = child
-                candidates.append(child)
-                child_ids.append(new_id)
-                region[parts == index] = new_id
-            row.update(
-                review_status="deleted",
-                review_note=edit["note"] + " Split into " + str(child_ids),
-            )
-            applied.append(dict(edit, child_ids=child_ids))
-            continue
-        if operation in ("replace", "add"):
-            pts = np.asarray(edit["polygon_xy"], float)
-            if (
-                pts.ndim != 2
-                or pts.shape[1] != 2
-                or len(pts) < 3
-                or not np.isfinite(pts).all()
-            ):
-                raise ValueError("Invalid correction polygon")
-            h, w = instances.shape
-            if (
-                (pts < 0).any()
-                or (pts[:, 0] >= w).any()
-                or (pts[:, 1] >= h).any()
-                or cv2.contourArea(pts.astype(np.float32)) <= 0
-            ):
-                raise ValueError("Correction polygon outside source or degenerate")
-            x0, y0 = np.floor(pts.min(axis=0)).astype(int)
-            x1, y1 = np.floor(pts.max(axis=0)).astype(int) + 1
-            painted = np.zeros((y1 - y0, x1 - x0), np.uint8)
-            cv2.fillPoly(painted, [(pts - [x0, y0]).astype(np.int32)], 1)
-            existing = instances[y0:y1, x0:x1]
-            if np.any((existing != 0) & (existing != oid) & (painted != 0)):
-                raise ValueError(
-                    "Correction overlaps another instance; review the conflict"
-                )
-            instances[instances == oid] = 0
-            existing[painted != 0] = oid
-            if operation == "add":
-                by_id[oid] = (
-                    dict(
-                        object_id=oid,
-                        **{key: "" for key in candidates[0] if key != "object_id"},
-                    )
-                    if candidates
-                    else dict(object_id=oid)
-                )
-                candidates.append(by_id[oid])
-                by_id[oid]["review_reason"] = "manual_addition"
-            by_id[oid].update(
-                x0=int(x0),
-                y0=int(y0),
-                x1=int(x1),
-                y1=int(y1),
-                area_px=int(painted.sum()),
-            )
-        elif operation == "delete":
-            instances[instances == oid] = 0
-        elif operation not in ("accept", "reclassify"):
-            raise ValueError(f"Unknown action {operation}")
-        if operation in ("add", "replace", "reclassify"):
-            cls = int(edit["class_id"])
-            if cls not in (0, 1):
-                raise ValueError("Class ID must be 0 or 1")
-            by_id[oid]["class_id"] = cls
-        by_id[oid].update(
-            review_status="deleted" if operation == "delete" else "visually_reviewed",
-            review_note=edit["note"],
-        )
-        applied.append(edit)
-    return applied
-
-
-def refresh_edited_measurements(raw, instances, candidates, cfg):
-    """Recompute evidence after changed masks; do not retain stale area/shape."""
-    z, _ = standardize(raw, cfg["background_cell_px"], cfg["noise_floor"])
-    slices = ndimage.find_objects(instances)
-    for row in candidates:
-        oid = row["object_id"]
-        if row["review_status"] == "deleted":
-            continue
-        sl = slices[oid - 1]
-        if sl is None:
-            raise ValueError("Active reviewed object has no pixels")
-        row.update(measurements(instances[sl] == oid, z[sl], raw[sl]))
-        row.update(x0=sl[1].start, y0=sl[0].start, x1=sl[1].stop, y1=sl[0].stop)
-
-
-def export_source(raw, info, instances, candidates, output, cfg):
-    size = cfg["tile_size"]
-    h, w = raw.shape
-    source = Path(info["file"]).stem
-    class_lookup = np.zeros(
-        max([r["object_id"] for r in candidates], default=0) + 1, np.uint8
+    smoothed = ndimage.gaussian_filter(
+        snr,
+        sigma=config["detection_smoothing_sigma_px"],
+        mode="reflect",
     )
-    for r in candidates:
-        class_lookup[r["object_id"]] = r["class_id"] + 1
-    class_full = class_lookup[instances]
-    np.save(output / "instances" / f"{source}.npy", instances)
-    Image.fromarray(class_full).save(output / "repatched" / f"{source}_mask.png")
-    rebuilt_gray = np.zeros((h, w), np.uint8)
-    rebuilt_mask = np.zeros((h, w), np.uint8)
-    metadata = []
-    object_map = []
-    covered = 0
-    exact_raw = True
-    exact_polygons = True
-    for y in range(0, h, size):
-        for x in range(0, w, size):
-            vh, vw = min(size, h - y), min(size, w - x)
-            name = f"{source}_x{x:05d}_y{y:05d}"
-            scientific = np.zeros((size, size), raw.dtype)
-            scientific[:vh, :vw] = raw[y : y + vh, x : x + vw]
-            np.save(output / "scientific_tiles" / f"{name}.npy", scientific)
-            restored = np.load(output / "scientific_tiles" / f"{name}.npy")
-            exact_raw &= bool(
-                np.array_equal(
-                    restored[:vh, :vw], raw[y : y + vh, x : x + vw], equal_nan=True
-                )
-            )
-            valid = np.zeros((size, size), np.uint8)
-            valid[:vh, :vw] = 255
-            Image.fromarray(valid).save(output / "valid_pixels" / f"{name}.png")
-            gray = np.zeros((size, size), np.uint8)
-            gray[:vh, :vw] = display(scientific[:vh, :vw], info["display_limits"])
-            mask = np.zeros((size, size), np.uint8)
-            mask[:vh, :vw] = class_full[y : y + vh, x : x + vw]
-            local = instances[y : y + vh, x : x + vw]
-            rows = []
-            raster_mask = np.zeros((size, size), np.uint8)
-            # Each clipped fragment retains its full-image parent object ID/class.
-            for oid in np.unique(local):
-                if oid == 0:
-                    continue
-                ry, rx = np.nonzero(local == oid)
-                x0, x1 = int(rx.min()), int(rx.max() + 1)
-                y0, y1 = int(ry.min()), int(ry.max() + 1)
-                component = local[y0:y1, x0:x1] == oid
-                for poly in mask_polygons(component, (x0, y0), size):
-                    cls = int(class_lookup[oid] - 1)
-                    row = str(cls) + " " + " ".join(f"{v:.8f}" for v in poly.ravel())
-                    # Test the serialized coordinates, not the unrounded polygon.
-                    parsed = np.array(list(map(float, row.split()[1:]))).reshape(-1, 2)
-                    raster_mask[rasterize(parsed, size)] = cls + 1
-                    rows.append(row)
-                    object_map.append(
-                        dict(
-                            tile=name,
-                            label_row=len(rows),
-                            object_id=int(oid),
-                            class_id=cls,
-                        )
-                    )
-            exact_polygons &= bool(np.array_equal(raster_mask, mask))
-            (output / "labels" / f"{name}.txt").write_text(
-                "\n".join(rows) + ("\n" if rows else ""), encoding="utf-8"
-            )
-            Image.fromarray(gray).save(output / "images" / f"{name}.png")
-            Image.fromarray(mask).save(output / "masks" / f"{name}.png")
-            Image.fromarray(overlay(gray, mask)).save(
-                output / "overlays" / f"{name}.png"
-            )
-            rebuilt_gray[y : y + vh, x : x + vw] = gray[:vh, :vw]
-            rebuilt_mask[y : y + vh, x : x + vw] = mask[:vh, :vw]
-            metadata.append(
-                dict(
-                    tile=name,
-                    source=info["file"],
-                    row=y // size,
-                    column=x // size,
-                    x_offset=x,
-                    y_offset=y,
-                    original_width=w,
-                    original_height=h,
-                    valid_width=vw,
-                    valid_height=vh,
-                    pad_right=size - vw,
-                    pad_bottom=size - vh,
-                )
-            )
-            covered += vh * vw
-    Image.fromarray(rebuilt_gray).save(output / "repatched" / f"{source}_processed.png")
-    rgb = overlay(rebuilt_gray, rebuilt_mask)
-    Image.fromarray(rgb).save(output / "repatched" / f"{source}_overlay.png")
-    thumb = Image.fromarray(rgb)
-    thumb.thumbnail((1600, 1100))
-    thumb.save(output / "inspection" / source / "overlay_overview.png")
-    checks = dict(
-        scientific_pixels_lossless=exact_raw,
-        polygons_match_masks=exact_polygons,
-        masks_repatch_exactly=bool(np.array_equal(rebuilt_mask, class_full)),
-        original_pixel_count=h * w,
-        covered_original_pixels=covered,
-        no_source_pixels_lost=covered == h * w,
-        original_sha256_unchanged=info["sha256"],
+    score, smoothed_info = standardize_local_background(
+        smoothed,
+        config["background_cell_px"],
+        0.05,
     )
-    if not all(
-        checks[k]
-        for k in [
-            "scientific_pixels_lossless",
-            "polygons_match_masks",
-            "masks_repatch_exactly",
-            "no_source_pixels_lost",
-        ]
+
+    support = (score >= config["grow_sigma"]) & finite
+    seeds = (score >= config["seed_sigma"]) & finite
+
+    labels, component_count = ndimage.label(
+        support,
+        structure=np.ones((3, 3), dtype=np.uint8),
+    )
+    seeded_ids = np.unique(labels[seeds])
+    seeded_ids = seeded_ids[seeded_ids != 0]
+
+    allowed = np.zeros(component_count + 1, dtype=bool)
+    allowed[seeded_ids] = True
+
+    instances = np.zeros(raw.shape, dtype=np.int32)
+    candidates: list[dict[str, Any]] = []
+    next_object_id = 1
+
+    for old_id, component_slice in enumerate(
+        ndimage.find_objects(labels),
+        start=1,
     ):
-        raise AssertionError(f"Export validation failed: {checks}")
-    return metadata, object_map, checks
+        if component_slice is None or not allowed[old_id]:
+            continue
 
+        component = labels[component_slice] == old_id
+        if int(component.sum()) < config["minimum_area_px"]:
+            continue
 
-def run(args):
-    cfg = yaml.safe_load(args.config.read_text())
-    paths = discover_inputs(args.input)
-    if not paths:
-        raise ValueError("No FITS inputs found")
-    if len({p.stem for p in paths}) != len(paths):
-        raise ValueError("Duplicate source stems would collide")
-    if not args.inspect_only and not args.diagnostic and len(paths) != 10:
-        raise ValueError(
-            f"Question 1 requires 10 FITS images; found {len(paths)}. Use --inspect-only for inspection, or --diagnostic for an explicitly incomplete test run."
+        component = (
+            ndimage.binary_fill_holes(component)
+            & finite[component_slice]
         )
-    if cfg["tile_size"] != 1024:
-        raise ValueError("Question 1 requires exact 1024px tiles")
+        metrics = measure_component(
+            component,
+            snr[component_slice],
+            raw[component_slice],
+        )
+
+        if metrics["peak_snr"] < config["minimum_peak_snr"]:
+            continue
+
+        streak = config["streak"]
+        is_streak = (
+            metrics["elongation"] >= streak["elongation_min"]
+            and metrics["major_axis_px"] >= streak["major_axis_min_px"]
+            and metrics["eccentricity"] >= streak["eccentricity_min"]
+        )
+
+        y0 = component_slice[0].start
+        y1 = component_slice[0].stop
+        x0 = component_slice[1].start
+        x1 = component_slice[1].stop
+
+        reasons = _review_reasons(
+            metrics,
+            (x0, y0, x1, y1),
+            raw.shape,
+            config,
+            is_streak,
+        )
+
+        region = instances[component_slice]
+        region[component] = next_object_id
+
+        candidates.append(
+            {
+                "object_id": next_object_id,
+                "class_id": int(is_streak),
+                "x0": x0,
+                "y0": y0,
+                "x1": x1,
+                "y1": y1,
+                **metrics,
+                "needs_review": bool(reasons),
+                "review_reason": ";".join(reasons),
+            }
+        )
+        next_object_id += 1
+
+    detection_info = {
+        "raw_background": background_info,
+        "smoothed_background": smoothed_info,
+        "candidate_count": len(candidates),
+    }
+    return instances, candidates, detection_info
+
+
+def export_source(
+    raw: np.ndarray,
+    info: dict[str, Any],
+    instances: np.ndarray,
+    candidates: list[dict[str, Any]],
+    output_dir: Path,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Export tiles, masks, YOLO labels, overlays, and repatched images."""
+    tile_size = config["tile_size"]
+    height, width = raw.shape
+    source_stem = Path(info["file"]).stem
+
+    class_lookup = np.zeros(
+        max((row["object_id"] for row in candidates), default=0) + 1,
+        dtype=np.uint8,
+    )
+    for row in candidates:
+        class_lookup[row["object_id"]] = row["class_id"] + 1
+
+    full_class_mask = class_lookup[instances]
+    lower, upper = info["display_limits"]
+    full_display = make_display_image(raw, lower, upper)
+
+    metadata: list[dict[str, Any]] = []
+
+    for y0 in range(0, height, tile_size):
+        for x0 in range(0, width, tile_size):
+            valid_height = min(tile_size, height - y0)
+            valid_width = min(tile_size, width - x0)
+            tile_name = f"{source_stem}_x{x0:05d}_y{y0:05d}"
+
+            image_tile = np.zeros(
+                (tile_size, tile_size),
+                dtype=np.uint8,
+            )
+            mask_tile = np.zeros(
+                (tile_size, tile_size),
+                dtype=np.uint8,
+            )
+
+            image_tile[:valid_height, :valid_width] = full_display[
+                y0 : y0 + valid_height,
+                x0 : x0 + valid_width,
+            ]
+            mask_tile[:valid_height, :valid_width] = full_class_mask[
+                y0 : y0 + valid_height,
+                x0 : x0 + valid_width,
+            ]
+
+            local_instances = instances[
+                y0 : y0 + valid_height,
+                x0 : x0 + valid_width,
+            ]
+
+            label_rows: list[str] = []
+            rasterized_labels = np.zeros(
+                (tile_size, tile_size),
+                dtype=np.uint8,
+            )
+
+            for object_id in np.unique(local_instances):
+                if object_id == 0:
+                    continue
+
+                pixel_y, pixel_x = np.nonzero(
+                    local_instances == object_id
+                )
+                local_x0 = int(pixel_x.min())
+                local_x1 = int(pixel_x.max() + 1)
+                local_y0 = int(pixel_y.min())
+                local_y1 = int(pixel_y.max() + 1)
+
+                fragment = (
+                    local_instances[
+                        local_y0:local_y1,
+                        local_x0:local_x1,
+                    ]
+                    == object_id
+                )
+                polygons = mask_to_polygons(
+                    fragment,
+                    offset_xy=(local_x0, local_y0),
+                    tile_size=tile_size,
+                )
+
+                class_id = int(class_lookup[object_id] - 1)
+
+                for polygon in polygons:
+                    values = " ".join(
+                        f"{value:.8f}"
+                        for value in polygon.ravel()
+                    )
+                    label_rows.append(f"{class_id} {values}")
+
+                    parsed = np.asarray(
+                        [float(value) for value in values.split()],
+                        dtype=np.float32,
+                    ).reshape(-1, 2)
+                    rasterized_labels[
+                        rasterize_polygon(parsed, tile_size)
+                    ] = class_id + 1
+
+            if not np.array_equal(
+                rasterized_labels,
+                mask_tile,
+            ):
+                raise AssertionError(
+                    "YOLO polygons do not reproduce mask for tile: "
+                    f"{tile_name}"
+                )
+
+            Image.fromarray(image_tile).save(
+                output_dir / "images" / f"{tile_name}.png"
+            )
+            Image.fromarray(mask_tile).save(
+                output_dir / "masks" / f"{tile_name}.png"
+            )
+            Image.fromarray(
+                overlay_mask(image_tile, mask_tile)
+            ).save(
+                output_dir / "overlays" / f"{tile_name}.png"
+            )
+            (
+                output_dir / "labels" / f"{tile_name}.txt"
+            ).write_text(
+                "
+".join(label_rows)
+                + ("
+" if label_rows else ""),
+                encoding="utf-8",
+            )
+
+            metadata.append(
+                {
+                    "tile": tile_name,
+                    "source": info["file"],
+                    "row": y0 // tile_size,
+                    "column": x0 // tile_size,
+                    "x_offset": x0,
+                    "y_offset": y0,
+                    "original_width": width,
+                    "original_height": height,
+                    "valid_width": valid_width,
+                    "valid_height": valid_height,
+                    "pad_right": tile_size - valid_width,
+                    "pad_bottom": tile_size - valid_height,
+                }
+            )
+
+    Image.fromarray(full_display).save(
+        output_dir
+        / "repatched"
+        / f"{source_stem}_processed.png"
+    )
+    Image.fromarray(full_class_mask).save(
+        output_dir
+        / "repatched"
+        / f"{source_stem}_mask.png"
+    )
+    Image.fromarray(
+        overlay_mask(full_display, full_class_mask)
+    ).save(
+        output_dir
+        / "repatched"
+        / f"{source_stem}_overlay.png"
+    )
+
+    return metadata
+
+
+def run(args: argparse.Namespace) -> None:
+    """Run inspection and annotation export for all discovered FITS files."""
+    config = yaml.safe_load(
+        args.config.read_text(encoding="utf-8")
+    )
+    fits_files = discover_fits_files(args.input)
+
+    if not fits_files:
+        raise ValueError("No FITS files found.")
+
+    if config["tile_size"] != 1024:
+        raise ValueError(
+            "The assessment requires tile_size: 1024."
+        )
+
     if args.output.exists():
         raise FileExistsError(
-            "Use a new output directory; previous work will not be overwritten"
+            f"Output folder already exists: {args.output}. "
+            "Use a new folder to avoid overwriting previous work."
         )
+
     args.output.mkdir(parents=True)
+    required_folders = ["inspection"]
+
+    if not args.inspect_only:
+        required_folders += [
+            "images",
+            "labels",
+            "masks",
+            "overlays",
+            "repatched",
+            "qa",
+        ]
+
+    for folder in required_folders:
+        (args.output / folder).mkdir()
+
+    inventory = {
+        "found": len(fits_files),
+        "required_by_assessment": 10,
+        "dataset_complete": len(fits_files) == 10,
+        "files": [path.name for path in fits_files],
+    }
     write_json(
         args.output / "inventory.json",
-        dict(
-            found=len(paths),
-            required=10,
-            dataset_complete=len(paths) == 10,
-            mode=(
-                "inspection"
-                if args.inspect_only
-                else "diagnostic" if args.diagnostic else "full_dataset"
-            ),
-            files=[p.name for p in paths],
-        ),
+        inventory,
     )
-    for folder in [
-        "inspection",
-        "images",
-        "labels",
-        "masks",
-        "overlays",
-        "scientific_tiles",
-        "valid_pixels",
-        "instances",
-        "repatched",
-        "qa",
-    ]:
-        (args.output / folder).mkdir()
-    all_rows = []
-    all_metadata = []
-    all_map = []
-    sources = []
-    for path in paths:
-        print(f"Inspecting {path.name}", flush=True)
-        raw, info = inspect_source(path, args.output / "inspection" / path.stem)
+
+    if len(fits_files) != 10:
+        print(
+            f"NOTE: found {len(fits_files)} FITS file(s). "
+            "The final assessment run must use all 10 supplied images.",
+            flush=True,
+        )
+
+    all_candidates: list[dict[str, Any]] = []
+    all_metadata: list[dict[str, Any]] = []
+    source_summaries: list[dict[str, Any]] = []
+
+    for path in fits_files:
+        print(
+            f"Inspecting: {path.name}",
+            flush=True,
+        )
+        raw, info = inspect_source(
+            path,
+            args.output / "inspection" / path.stem,
+        )
+
         if args.inspect_only:
             continue
-        print("Detecting full-image candidates before clipping to tiles", flush=True)
-        instances, rows, noise = detect(raw, cfg)
-        for row in rows:
-            row["source"] = path.name
-        correction_data = None
-        if args.corrections:
-            if args.corrections.is_dir():
-                review_path = args.corrections / f"{path.stem}.json"
-                if review_path.exists():
-                    correction_data = json.loads(review_path.read_text())
-            else:
-                if len(paths) != 1:
-                    raise ValueError(
-                        "For multiple images, supply a corrections folder with one JSON file per source stem"
-                    )
-                correction_data = json.loads(args.corrections.read_text())
-        if correction_data and correction_data.get("config") != json.loads(
-            json.dumps(cfg)
-        ):
-            raise ValueError(
-                "Corrections must include the exact detection config to keep object IDs stable"
-            )
-        edits = apply_corrections(instances, rows, correction_data, info["sha256"])
-        for row in rows:
-            row["source"] = path.name
-        if edits:
-            refresh_edited_measurements(raw, instances, rows, cfg)
-        print(f"Exporting {len(rows)} candidates", flush=True)
-        metadata, mapping, checks = export_source(
-            raw, info, instances, rows, args.output, cfg
+
+        print(
+            f"Detecting candidates: {path.name}",
+            flush=True,
         )
-        if sha256(path) != info["sha256"]:
-            raise AssertionError("Source FITS changed during processing")
-        sources.append(
-            dict(
-                file=path.name,
-                statistics=info,
-                noise=noise,
-                checks=checks,
-                corrections_applied=edits,
-            )
+        instances, candidates, detection_info = (
+            detect_candidates(raw, config)
         )
-        all_rows += rows
-        all_metadata += metadata
-        all_map += mapping
-        del raw, instances
+
+        for row in candidates:
+            row["source"] = path.name
+
+        metadata = export_source(
+            raw,
+            info,
+            instances,
+            candidates,
+            args.output,
+            config,
+        )
+
+        all_candidates.extend(candidates)
+        all_metadata.extend(metadata)
+        source_summaries.append(
+            {
+                "file": path.name,
+                "shape_yx": info["shape_yx"],
+                "candidate_count": len(candidates),
+                "review_required": sum(
+                    bool(row["needs_review"])
+                    for row in candidates
+                ),
+                "detection": detection_info,
+            }
+        )
+
     if args.inspect_only:
+        print(
+            f"Inspection outputs written to: {args.output}",
+            flush=True,
+        )
         return
-    write_csv(args.output / "tile_metadata.csv", all_metadata)
+
+    candidate_fields = [
+        "source",
+        "object_id",
+        "class_id",
+        "x0",
+        "y0",
+        "x1",
+        "y1",
+        "area_px",
+        "width_px",
+        "height_px",
+        "major_axis_px",
+        "minor_axis_px",
+        "elongation",
+        "eccentricity",
+        "orientation_deg",
+        "compactness",
+        "peak_intensity",
+        "mean_intensity",
+        "peak_snr",
+        "mean_snr",
+        "needs_review",
+        "review_reason",
+    ]
     write_csv(
         args.output / "qa" / "candidates.csv",
-        all_rows,
-        fields=(
-            list(all_rows[0])
-            if all_rows
-            else ["object_id", "class_id", "review_status"]
-        ),
+        all_candidates,
+        candidate_fields,
     )
+
+    metadata_fields = [
+        "tile",
+        "source",
+        "row",
+        "column",
+        "x_offset",
+        "y_offset",
+        "original_width",
+        "original_height",
+        "valid_width",
+        "valid_height",
+        "pad_right",
+        "pad_bottom",
+    ]
     write_csv(
-        args.output / "qa" / "label_instances.csv",
-        all_map,
-        fields=["tile", "label_row", "object_id", "class_id"],
+        args.output / "tile_metadata.csv",
+        all_metadata,
+        metadata_fields,
     )
+
+    class_counts = {
+        str(class_id): sum(
+            row["class_id"] == class_id
+            for row in all_candidates
+        )
+        for class_id in CLASS_NAMES
+    }
     write_json(
         args.output / "qa" / "run_summary.json",
-        dict(
-            status="draft_pending_review",
-            input_count=len(paths),
-            required_input_count=10,
-            tile_count=len(all_metadata),
-            candidate_count=sum(r["review_status"] != "deleted" for r in all_rows),
-            audit_rows=len(all_rows),
-            pending_review=sum(r["review_status"] == "pending" for r in all_rows),
-            visually_reviewed=sum(
-                r["review_status"] == "visually_reviewed" for r in all_rows
+        {
+            "status": "automatic_draft_pending_manual_qa",
+            "input_count": len(fits_files),
+            "assessment_input_count": 10,
+            "dataset_complete": len(fits_files) == 10,
+            "tile_count": len(all_metadata),
+            "candidate_count": len(all_candidates),
+            "review_required_count": sum(
+                bool(row["needs_review"])
+                for row in all_candidates
             ),
-            class_counts={
-                str(c): sum(
-                    r["class_id"] == c and r["review_status"] != "deleted"
-                    for r in all_rows
-                )
-                for c in [0, 1]
-            },
-            sources=sources,
-            config=cfg,
-        ),
+            "class_counts": class_counts,
+            "sources": source_summaries,
+            "config": config,
+        },
     )
-    # No fictitious train/validation split: these are annotation outputs only.
-    (args.output / "data.yaml").write_text(
+
+    data_yaml = {
+        "path": ".",
+        "train": "images",
+        "val": None,
+        "names": CLASS_NAMES,
+    }
+    (
+        args.output / "data.yaml"
+    ).write_text(
         yaml.safe_dump(
-            dict(
-                path=str(args.output.resolve()),
-                train="images",
-                val=None,
-                names={0: "star_blob", 1: "streak_object"},
-            ),
+            data_yaml,
             sort_keys=False,
-        )
+        ),
+        encoding="utf-8",
+    )
+
+    print(
+        f"Question 1 draft written to: {args.output}",
+        flush=True,
     )
     print(
-        f"Completed draft export to {args.output}; manual annotation QA remains separate.",
+        "Next: review flagged candidates, correct inaccurate masks/classes, "
+        "then run validate_outputs.py.",
         flush=True,
     )
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, type=Path)
-    parser.add_argument("--output", required=True, type=Path)
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+    )
+    parser.add_argument(
+        "--input",
+        required=True,
+        type=Path,
+        help="FITS file or folder containing FITS images.",
+    )
+    parser.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="New output folder for this run.",
+    )
     parser.add_argument(
         "--config",
         type=Path,
-        default=Path(__file__).resolve().parents[1] / "config.yaml",
+        default=(
+            Path(__file__).resolve().parents[1]
+            / "config.yaml"
+        ),
+        help="Path to config.yaml.",
     )
-    parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument(
-        "--diagnostic",
+        "--inspect-only",
         action="store_true",
-        help="Incomplete dataset test; never marks assessment complete",
+        help="Only inspect FITS files; do not generate annotations.",
     )
-    parser.add_argument("--corrections", type=Path)
     run(parser.parse_args())
