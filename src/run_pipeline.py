@@ -182,6 +182,7 @@ def detect_candidates(
         config["background_cell_px"],
         config["noise_floor"],
     )
+    del work
 
     smoothed = ndimage.gaussian_filter(
         snr,
@@ -193,9 +194,11 @@ def detect_candidates(
         config["background_cell_px"],
         0.05,
     )
+    del smoothed
 
     support = (score >= config["grow_sigma"]) & finite
     seeds = (score >= config["seed_sigma"]) & finite
+    del score
 
     labels, component_count = ndimage.label(
         support,
@@ -203,6 +206,7 @@ def detect_candidates(
     )
     seeded_ids = np.unique(labels[seeds])
     seeded_ids = seeded_ids[seeded_ids != 0]
+    del seeds, support
 
     allowed = np.zeros(component_count + 1, dtype=bool)
     allowed[seeded_ids] = True
@@ -439,12 +443,20 @@ def export_source(
         / "repatched"
         / f"{source_stem}_mask.png"
     )
-    Image.fromarray(
-        overlay_mask(full_display, full_class_mask)
-    ).save(
+    full_overlay = overlay_mask(full_display, full_class_mask)
+    Image.fromarray(full_overlay).save(
         output_dir
         / "repatched"
         / f"{source_stem}_overlay.png"
+    )
+
+    overview = Image.fromarray(full_overlay)
+    overview.thumbnail((1600, 1200))
+    overview.save(
+        output_dir
+        / "inspection"
+        / source_stem
+        / "annotation_overview.png"
     )
 
     return metadata
