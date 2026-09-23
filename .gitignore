@@ -1,18 +1,20 @@
-# Environment
+# Python
 .venv/
 __pycache__/
 *.pyc
+.pytest_cache/
 
-# Confidential / raw data
+# Confidential Digantara data
 data/
 *.fits
 *.fit
 *.fts
 
-# Generated runs
-run_full_inspection/
-run_question1_all10/
+# Generated outputs
+runs/
+run_*/
+outputs/
 reviews/
 
-# Private submission files
+# Private submission archives
 *.zip
