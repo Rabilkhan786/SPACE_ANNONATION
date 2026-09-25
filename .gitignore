@@ -18,9 +18,12 @@ runs/
 run_*/
 outputs/
 reviews/
+submission/
 
 # Private submission archives
 *.zip
+*.pdf
+*.mp4
 
 # Local credentials
 .env
