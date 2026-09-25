@@ -11,6 +11,9 @@ data/
 *.fts
 
 # Generated outputs
+tiles/
+annotations/
+tile_metadata.csv
 runs/
 run_*/
 outputs/
@@ -18,3 +21,7 @@ reviews/
 
 # Private submission archives
 *.zip
+
+# Local credentials
+.env
+.env.*
