@@ -1,173 +1,156 @@
-# Digantara assessment — Question 1
+# Digantara AI/ML Data Annotation Intern Assessment
 
-Identify compact stars (`star_blob`) and elongated sources (`streak_object`) in
-10 astronomical FITS images. This is a **Python data-preparation + Roboflow
-auto-label proposals + review/correction + validation workflow**. No model
-training or Question 2 is included.
+This repository covers the assessment workflow for annotating astronomical FITS images.
 
-## Current status — 25 September 2026
+Two classes are used:
 
-All 10 FITS files were processed into 700 PNG tiles. Preparation checks passed
-for every tile, including metadata, dimensions, exact display pixels and padding.
-The original FITS checksums are unchanged. Representative tiles were inspected
-visually. The three scripts compile and the installed dependencies are compatible.
+- `star_blob` — compact, point-like or blob-like source
+- `streak_object` — elongated, continuous source
 
-Roboflow MCP is connected. After private-project creation was rejected by this
-workspace, the user explicitly chose a public project for these sample image
-tiles and approved the `BY-NC-SA 4.0` license.
-Project: [Sky Annotation Q1](https://app.roboflow.com/ahammed-rabil/sky-annotation-q1),
-type **Instance Segmentation**, visibility **public**. Upload was verified:
-**700 PNG tiles imported, 0 duplicates, 0 upload errors, 0 annotations**.
-The user subsequently requested Auto Label and Review. A two-tile pilot completed
-successfully with **171 draft polygons: 170 star blobs and 1 streak**. Its job is
-in the **Review** queue with **0 approved**; 698 tiles remain unassigned and the
-approved Dataset count is 0. Initial overlay inspection is not final QA.
-Raw FITS and old automatic labels were not uploaded. Full-batch annotation,
-detailed correction, export, mask processing and final validation remain pending.
+The solution is intentionally simple: Python prepares the FITS data, Roboflow is used for manual instance-segmentation annotation, and Python converts/validates the reviewed annotations.
 
-Pilot: [Auto-label review job](https://app.roboflow.com/ahammed-rabil/sky-annotation-q1/annotate/job/D0c6FKE4qLouH2qcBixd?startReviewing=1).
-Auto-label task ID: `7cfe80c6-44c2-4d42-b5ab-8b1c3a03b488`.
-The batch run reported 2 labeled images, 171 annotations and 0 resized images.
-The Auto Label job's Review screen was opened and both overlays inspected.
-This is preliminary agent inspection, not completed human QA or approval.
-The standalone team-wide "Enable Review Mode" control is plan-locked, but
-the auto-label job itself exposes working Approve/Reject review controls.
-Scaling is paused pending a spending limit and a confirmed full-run estimate:
-the UI shows a 15-credit allowance, with recent usage potentially delayed.
-No extra credits were purchased and no subscription was changed.
+## Assessment workflow
 
-## Why Roboflow?
-
-The old heuristic pipeline produced many uncertain detections. Old automatic
-labels are not imported or treated as ground truth. At the user's request,
-Roboflow Auto Label now generates editable proposals for review and correction.
-On a representative tile, SAM 3 with descriptive prompts found no objects;
-short prompts at confidence 0.1 found only one star and one streak. The
-`gpt-6-astra-sam3-polygons` preview found 59 stars and one streak, so it was used
-for the two-image pilot with classes `star_blob` and `streak_object`. This hosted
-vision-model use is limited to the requested auto-label step, not a new local
-LLM application. Preview counts differ from the subsequent batch predictions.
-Neither model confidence nor a successful job establishes annotation accuracy.
-Check the workspace's current cost estimate before scaling; do not purchase
-credits or upgrade a plan automatically.
-
-## Workflow and files
-
-FITS → display stretch → 1024×1024 PNG tiles → Roboflow auto-label proposals →
-review and manual correction →
-YOLO segmentation export → pixel masks and overlays → full-size reconstruction →
-validation.
-
-| File/folder | Purpose |
-|---|---|
-| `data/raw/` | The 10 original, confidential FITS files |
-| `src/prepare_tiles.py` | Read FITS, improve display contrast and create tiles |
-| `tiles/` | PNG tiles for auto-labeling and visual review |
-| `tile_metadata.csv` | Source, tile, coordinates and valid dimensions |
-| `annotations/labels/` | Human-reviewed YOLO segmentation TXT files |
-| `src/process_annotations.py` | Convert polygons to masks, overlays and full images |
-| `annotations/masks/` | One class mask per tile |
-| `outputs/overlays/` | Tile images with colored annotations |
-| `outputs/repatched/` | Full-size display images, masks and overlays |
-| `src/validate.py` | Check files, coordinates, padding and reconstruction |
-
-## Prepare
-
-Run from this project folder with Python 3.10+ (the existing `.venv` uses 3.14).
-Activate the existing environment first: `.venv\Scripts\activate` in Windows CMD.
-
-```bat
-python -m pip install -r requirements.txt
-python src\prepare_tiles.py
+```text
+10 FITS images
+    ↓
+display preprocessing
+    ↓
+1024×1024 PNG tiles
+    ↓
+Roboflow manual instance segmentation
+    ↓
+YOLO segmentation export
+    ↓
+pixel masks + overlays
+    ↓
+full-size reconstruction
+    ↓
+validation
 ```
 
-The script reads the first 2D image HDU in each FITS file. Each image's 1st and
-99.99th percentiles plus an arcsinh stretch produce an 8-bit grayscale display.
-This adapts to different brightness ranges; it is not scientific calibration or
-a lossless conversion of the original intensity values. FITS files stay unchanged.
+### A1 — Inspect and preprocess
 
-Tiles are never resized and no valid spatial pixels are cropped. Zero padding is
-added only on the right/bottom. A 9568×6380 image gets 672 right and 788 bottom
-padding pixels, giving 70 tiles. All 10 supplied images give 700 tiles.
-Counts and padding are calculated from actual dimensions.
+`src/prepare_tiles.py` reads the first 2D FITS image plane and creates an 8-bit display image using percentile clipping and an arcsinh stretch.
 
-Existing tiles/metadata are not overwritten. Preserve them elsewhere before
-rerunning preparation. The same safety rule applies to existing processed masks.
+This is only for visualization and annotation. The original FITS files are never modified.
 
-## Annotate in Roboflow
+### A2 — Create 1024×1024 tiles
 
-This run uses the **public Instance Segmentation** project explicitly approved by
-the user above. Upload only `tiles/*.png`, never raw FITS or the old automatic
-labels. Public visibility applies to the uploaded tiles; do not assume they are
-private. This approval does not cover other company materials or future datasets.
-For confidential material without explicit public-sharing approval, use a private
-destination and confirm its visibility before uploading.
+The display image is split without resizing or cropping valid pixels.
 
-| Class | YOLO ID | Raster mask value |
+For a 9568×6380 image:
+
+- right padding: 672 pixels
+- bottom padding: 788 pixels
+- padded size: 10240×7168
+- tiles: 10 × 7 = 70
+
+Padding is added only outside the original image. `tile_metadata.csv` stores each tile position and valid size so the final result can be reconstructed correctly.
+
+### A3 — Annotate two classes
+
+Create a **Roboflow Instance Segmentation** project and use:
+
+| Class | YOLO ID | Raster mask |
 |---|---:|---:|
-| Background | No polygon | 0 |
+| background | — | 0 |
 | star_blob | 0 | 1 |
 | streak_object | 1 | 2 |
 
-- Draw a separate polygon around each clearly visible compact source.
-- Draw tight polygons around clearly elongated, continuous streaks.
-- Do not turn neighboring stars into one streak or label random noise.
-- Annotate faint sources only when distinguishable from background; leave
-  uncertain cases for human review.
-- At tile edges, annotate the visible portion in each neighboring tile.
-- Do not annotate black padding. Metadata gives the valid width/height.
+Annotation rules:
 
-Zoom in and review polygon boundaries. Cyan overlays show blobs; orange shows
-streaks. Human review, not a successful script run, establishes annotation quality.
+- Draw a separate polygon around each clearly visible compact star/blob.
+- Draw a tight polygon around each clearly elongated continuous streak.
+- Do not label random noise.
+- Do not merge nearby stars into one streak.
+- Annotate faint sources only when they can be distinguished from the background.
+- At tile edges, annotate only the visible part of the object.
+- Never annotate the black padding area.
 
-The connected MCP supports project inspection/creation, image-upload preparation,
-auto-label previews and jobs, review status, saving supplied annotations and export. These
-operations do not replace visual judgment. There is no dedicated class-creation
-action in the inspected tools; use Project Settings → Classes when needed.
-Never create fake annotations just to create class names.
+After review, export **YOLOv8/Ultralytics instance segmentation** labels from Roboflow.
 
-## Export, process and validate
+## Project files
 
-After all tiles are annotated and reviewed, export **YOLOv8 instance segmentation
-(Ultralytics polygons)**, not bounding boxes. Include all original images,
-including reviewed empty tiles. Disable resizing, cropping, tiling, augmentation
-and filtering in the exported version so coordinates still match these tiles.
+```text
+src/
+  prepare_tiles.py
+  process_annotations.py
+  validate.py
 
-Check the export's `data.yaml`: ID 0 must be `star_blob` and ID 1 must be
-`streak_object`. TXT rows alone cannot verify the meaning of a numeric ID.
-Keep the export ZIP and YAML for this check; do not guess or silently swap IDs.
+data/raw/              # 10 FITS files, ignored by Git
+tiles/                 # generated 1024×1024 PNG tiles
+annotations/labels/    # reviewed YOLO segmentation labels
+annotations/masks/     # generated class masks
+outputs/overlays/      # tile overlays
+outputs/repatched/     # full-size image/mask/overlay
+tile_metadata.csv
+requirements.txt
+README.md
+```
 
-Put TXT files from all export splits into `annotations/labels/` (subfolders are
-accepted). Filenames must match PNG stems; the common `_png.rf.<hash>` suffix is
-also accepted. Unexpected or duplicate names cause an error. Each reviewed empty
-tile needs an empty TXT file. Missing files are **not** assumed to mean background;
-confirm empty tiles manually if the export omits their files.
+Generated data is ignored by Git.
+
+## Run
+
+Install dependencies:
+
+```bat
+python -m pip install -r requirements.txt
+```
+
+Prepare the annotation tiles:
+
+```bat
+python src\prepare_tiles.py
+```
+
+Upload only the PNG files from `tiles/` to Roboflow and complete manual review.
+
+Place the exported YOLO segmentation TXT files in:
+
+```text
+annotations/labels/
+```
+
+Then process the annotations:
 
 ```bat
 python src\process_annotations.py
+```
+
+Finally validate:
+
+```bat
 python src\validate.py
 ```
 
-Each TXT row is `class_id x1 y1 x2 y2 x3 y3 ...`, with coordinates in [0,1].
-Polygons are filled as pixel masks without changing the labels. A vertex on the
-outer image boundary maps to the last valid pixel. Different-class overlaps and
-polygons entering padding are rejected for review. Class masks combine same-class
-overlaps; separate instances remain in the original TXT polygons. Reconstruction
-removes padding using the metadata.
+A successful final check prints:
 
-Validation checks all 10 sources, tile counts/sizes, original display pixels,
-class IDs, polygon points, mask values, padding, polygon/mask agreement, overlays
-and exact reconstruction. It prints `VALIDATION PASSED` or a clear
-`VALIDATION FAILED` message. It does not measure annotation accuracy.
+```text
+VALIDATION PASSED
+```
 
-Until the reviewed export exists, mask processing and final validation are pending.
-No blank labels or old automatic annotations are generated to bypass this step.
+Validation checks files, tile geometry, polygon coordinates, mask values, padding and reconstruction. It does **not** replace human visual QA.
 
-## Confidentiality and previous work
+## Written reasoning
 
-Raw data, tiles, labels, outputs, metadata, ZIPs and credentials are ignored by Git.
-Share only with authorized reviewers. `.gitignore` does not make a cloud project
-private; check Roboflow privacy separately before upload.
+### 1. Why preprocessing is used
 
-The old scripts, runs and private ZIP were preserved outside this project at
-`../../work/automatic_pipeline_backup_20260925/`. They are reference only.
+The FITS images have different intensity ranges. A simple adaptive display stretch makes faint and bright sources easier to inspect while leaving the original FITS values unchanged. One fixed raw-intensity threshold is not used.
+
+### 2. How boundary tiles avoid data loss
+
+The image is never resized and valid pixels are never cropped. The right and bottom edges are zero-padded to the next multiple of 1024. For 9568×6380, this gives 10240×7168 and 70 tiles. Metadata records the valid part of every tile, and padding is removed during reconstruction.
+
+### 3. Short/thick streak versus blob
+
+A blob is compact and approximately point-like. A streak is visibly elongated and continuous. Short or thick ambiguous objects should be judged using shape and visual context instead of relying on one automatic threshold.
+
+### 4. Faint/small stars
+
+A faint source is annotated only when it is distinguishable from the surrounding noise and has a compact star-like appearance. Uncertain objects remain a manual-review decision.
+
+## Confidentiality
+
+The assessment data is confidential. Keep the GitHub repository and Roboflow project private, do not commit raw FITS files, and do not upload the raw FITS files to Roboflow.

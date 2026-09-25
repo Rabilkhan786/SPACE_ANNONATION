@@ -1,4 +1,4 @@
-"""Convert human-reviewed YOLO polygons to class masks and full-size overlays."""
+"""Convert reviewed YOLO polygons into masks, overlays and full-size outputs."""
 
 import csv
 from pathlib import Path
@@ -7,183 +7,249 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from prepare_tiles import ROOT, TILE_SIZE, FIELDS
+from prepare_tiles import FIELDS, ROOT, TILE_SIZE
 
 
 def load_metadata(root: Path = ROOT) -> list[dict]:
-    """Read the tile layout and check complete, non-overlapping source grids."""
+    """Read tile metadata and verify the source grids."""
     with (root / "tile_metadata.csv").open(newline="", encoding="utf-8") as stream:
         reader = csv.DictReader(stream)
         if reader.fieldnames != FIELDS:
             raise ValueError("Unexpected tile_metadata.csv columns.")
         rows = list(reader)
+
     if not rows:
         raise ValueError("Tile metadata is empty.")
+
     names = set()
     sources = {}
+
     for row in rows:
         for key in FIELDS[2:]:
             row[key] = int(row[key])
-        name, source = row["tile_file"], row["source_file"]
-        if Path(name).name != name or Path(source).name != source:
-            raise ValueError("Metadata must contain filenames, not paths.")
+
+        name = row["tile_file"]
+        source = row["source_file"]
         x, y = row["x"], row["y"]
-        w, h = row["original_width"], row["original_height"]
+        width = row["original_width"]
+        height = row["original_height"]
+
+        valid_width = min(TILE_SIZE, width - x)
+        valid_height = min(TILE_SIZE, height - y)
+
         if (
-            name in names
+            Path(name).name != name
+            or Path(source).name != source
+            or name in names
             or name != f"{Path(source).stem}_x{x:04d}_y{y:04d}.png"
-            or not (0 <= x < w and 0 <= y < h)
+            or x < 0
+            or y < 0
+            or x >= width
+            or y >= height
             or x % TILE_SIZE
             or y % TILE_SIZE
-            or row["valid_width"] != min(TILE_SIZE, w - x)
-            or row["valid_height"] != min(TILE_SIZE, h - y)
+            or row["valid_width"] != valid_width
+            or row["valid_height"] != valid_height
         ):
-            raise ValueError(f"Invalid or duplicate tile metadata: {name}")
+            raise ValueError(f"Invalid tile metadata: {name}")
+
         names.add(name)
         sources.setdefault(source, []).append(row)
+
     for source, group in sources.items():
-        w, h = group[0]["original_width"], group[0]["original_height"]
-        expected = ((w + TILE_SIZE - 1) // TILE_SIZE) * (
-            (h + TILE_SIZE - 1) // TILE_SIZE
+        width = group[0]["original_width"]
+        height = group[0]["original_height"]
+        expected = ((width + TILE_SIZE - 1) // TILE_SIZE) * (
+            (height + TILE_SIZE - 1) // TILE_SIZE
         )
-        if len(group) != expected or any(
-            (r["original_width"], r["original_height"]) != (w, h) for r in group
-        ):
-            raise ValueError(f"Incomplete or inconsistent tile grid: {source}")
-    actual = {p.name for p in (root / "tiles").glob("*.png")}
+        if len(group) != expected:
+            raise ValueError(f"Incomplete tile grid: {source}")
+
+    actual = {path.name for path in (root / "tiles").glob("*.png")}
     if actual != names:
-        raise ValueError("PNG files do not match tile_metadata.csv.")
+        raise ValueError("PNG tiles do not match tile_metadata.csv.")
+
     return rows
 
 
-def match_labels(rows: list[dict], root: Path = ROOT) -> dict[str, Path]:
-    """Require one label per tile; missing labels are NOT empty annotations."""
-    expected = {Path(r["tile_file"]).stem for r in rows}
-    matches = {}
-    for path in sorted((root / "annotations/labels").rglob("*.txt")):
+def find_labels(rows: list[dict], root: Path = ROOT) -> dict[str, Path]:
+    """Find YOLO labels. Missing TXT files are treated as reviewed empty tiles."""
+    expected = {Path(row["tile_file"]).stem for row in rows}
+    labels_dir = root / "annotations/labels"
+
+    if not labels_dir.exists():
+        raise ValueError("annotations/labels does not exist.")
+
+    labels = {}
+
+    for path in sorted(labels_dir.rglob("*.txt")):
         stem = path.stem
-        # Accept Roboflow's filename suffix, but never guess a different image.
+
         if stem not in expected:
             stem = stem.split("_png.rf.", 1)[0]
+
         if stem not in expected:
             raise ValueError(f"Label has no matching tile: {path.name}")
-        if stem in matches:
-            raise ValueError(f"More than one label for tile: {stem}")
-        matches[stem] = path
-    missing = sorted(expected - matches.keys())
-    if missing:
-        raise ValueError(
-            f"Missing {len(missing)} label files (first: {missing[0]}.txt). "
-            "Finish manual annotation/export; reviewed empty tiles need empty TXT files."
-        )
-    return matches
+
+        if stem in labels:
+            raise ValueError(f"Duplicate label file for tile: {stem}")
+
+        labels[stem] = path
+
+    return labels
 
 
-def polygon_mask(path: Path, valid_width: int, valid_height: int) -> np.ndarray:
-    """Rasterize YOLO segmentation; reject invalid polygons or padded annotations."""
+def polygon_mask(
+    label_path: Path | None,
+    valid_width: int,
+    valid_height: int,
+) -> np.ndarray:
+    """Convert one YOLO segmentation label file into a class mask."""
     mask = np.zeros((TILE_SIZE, TILE_SIZE), dtype=np.uint8)
-    for number, line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
+
+    if label_path is None:
+        return mask
+
+    for line_number, line in enumerate(
+        label_path.read_text(encoding="utf-8-sig").splitlines(),
+        1,
+    ):
         values = line.split()
+
         if not values:
             continue
-        prefix = f"{path.name}, row {number}"
-        if values[0] not in {"0", "1"} or len(values) < 7 or len(values) % 2 == 0:
-            raise ValueError(
-                f"{prefix}: expected class 0/1 and at least 3 polygon points, not boxes."
-            )
+
+        prefix = f"{label_path.name}, row {line_number}"
+
+        if values[0] not in {"0", "1"}:
+            raise ValueError(f"{prefix}: class must be 0 or 1.")
+
+        if len(values) < 7 or len(values) % 2 == 0:
+            raise ValueError(f"{prefix}: expected a segmentation polygon.")
+
         points = np.asarray(values[1:], dtype=np.float64).reshape(-1, 2)
+
         if not np.isfinite(points).all() or (points < 0).any() or (points > 1).any():
-            raise ValueError(
-                f"{prefix}: coordinates must be finite and between 0 and 1."
-            )
-        if (
-            len(np.unique(points, axis=0)) < 3
-            or cv2.contourArea(points.astype(np.float32)) <= 0
-        ):
-            raise ValueError(
-                f"{prefix}: polygon needs three distinct points and positive area."
-            )
+            raise ValueError(f"{prefix}: coordinates must be between 0 and 1.")
+
+        if len(np.unique(points, axis=0)) < 3:
+            raise ValueError(f"{prefix}: polygon needs at least three distinct points.")
+
         points *= TILE_SIZE
+
         if (points[:, 0] > valid_width + 1e-5).any() or (
             points[:, 1] > valid_height + 1e-5
         ).any():
-            raise ValueError(f"{prefix}: polygon enters the zero-padding area.")
-        # A vertex on the outer image boundary belongs to its last valid pixel.
+            raise ValueError(f"{prefix}: polygon enters the padding area.")
+
         pixels = np.floor(points).astype(np.int32)
         pixels[:, 0] = np.clip(pixels[:, 0], 0, valid_width - 1)
         pixels[:, 1] = np.clip(pixels[:, 1], 0, valid_height - 1)
+
+        if cv2.contourArea(pixels.astype(np.float32)) <= 0:
+            raise ValueError(f"{prefix}: polygon has no area.")
+
         region = np.zeros_like(mask)
         cv2.fillPoly(region, [pixels], 1)
-        value = int(values[0]) + 1
-        if ((region > 0) & (mask > 0) & (mask != value)).any():
-            raise ValueError(
-                f"{prefix}: different classes overlap; review the polygons."
-            )
-        mask[region > 0] = value
+
+        mask[region > 0] = int(values[0]) + 1
+
     return mask
 
 
 def overlay(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
-    """Show blobs in cyan and streaks in orange."""
+    """Create a simple RGB annotation overlay."""
     rgb = np.repeat(image[:, :, None], 3, axis=2)
+
     for value, color in [(1, [70, 220, 255]), (2, [255, 100, 70])]:
         selected = mask == value
-        rgb[selected] = (0.4 * rgb[selected] + 0.6 * np.array(color)).astype(np.uint8)
+        rgb[selected] = (
+            0.4 * rgb[selected] + 0.6 * np.asarray(color)
+        ).astype(np.uint8)
+
     return rgb
 
 
 def process(root: Path = ROOT) -> None:
+    """Create tile masks/overlays and repatch every source image."""
     rows = load_metadata(root)
-    labels = match_labels(rows, root)
-    destinations = [
-        root / p for p in ["annotations/masks", "outputs/overlays", "outputs/repatched"]
-    ]
-    for path in destinations:
+    labels = find_labels(rows, root)
+
+    masks_dir = root / "annotations/masks"
+    overlays_dir = root / "outputs/overlays"
+    repatched_dir = root / "outputs/repatched"
+
+    for path in [masks_dir, overlays_dir, repatched_dir]:
         if path.exists() and any(path.iterdir()):
-            raise ValueError(
-                f"Preserve existing outputs elsewhere before rerunning: {path}"
-            )
-    # Check all labels and inputs before creating any final outputs.
-    for row in rows:
-        name = row["tile_file"]
-        with Image.open(root / "tiles" / name) as image:
-            if image.size != (TILE_SIZE, TILE_SIZE) or image.mode != "L":
-                raise ValueError(f"Expected a 1024x1024 grayscale tile: {name}")
-            array = np.asarray(image)
-            if (
-                array[row["valid_height"] :, :].any()
-                or array[:, row["valid_width"] :].any()
-            ):
-                raise ValueError(f"Nonzero image padding: {name}")
-        polygon_mask(labels[Path(name).stem], row["valid_width"], row["valid_height"])
-    for path in destinations:
+            raise ValueError(f"Output already exists: {path}")
+
+    for path in [masks_dir, overlays_dir, repatched_dir]:
         path.mkdir(parents=True, exist_ok=True)
-    print("Processing human annotations...", flush=True)
-    for source in dict.fromkeys(r["source_file"] for r in rows):
-        group = [r for r in rows if r["source_file"] == source]
-        full_image = np.zeros(
-            (group[0]["original_height"], group[0]["original_width"]), dtype=np.uint8
-        )
-        full_mask = np.zeros_like(full_image)
+
+    print(
+        f"Found {len(labels)} label files for {len(rows)} tiles. "
+        "Tiles without a TXT file are treated as empty annotations."
+    )
+
+    sources = dict.fromkeys(row["source_file"] for row in rows)
+
+    for source in sources:
+        group = [row for row in rows if row["source_file"] == source]
+        height = group[0]["original_height"]
+        width = group[0]["original_width"]
+
+        full_image = np.zeros((height, width), dtype=np.uint8)
+        full_mask = np.zeros((height, width), dtype=np.uint8)
+
         for row in group:
             name = row["tile_file"]
-            image = np.asarray(Image.open(root / "tiles" / name))
+            stem = Path(name).stem
+
+            with Image.open(root / "tiles" / name) as image_file:
+                image = np.asarray(image_file.convert("L"))
+
+            if image.shape != (TILE_SIZE, TILE_SIZE):
+                raise ValueError(f"Tile must be 1024x1024: {name}")
+
             mask = polygon_mask(
-                labels[Path(name).stem], row["valid_width"], row["valid_height"]
+                labels.get(stem),
+                row["valid_width"],
+                row["valid_height"],
             )
-            Image.fromarray(mask).save(destinations[0] / name)
-            Image.fromarray(overlay(image, mask)).save(destinations[1] / name)
-            x, y, w, h = (row[k] for k in ["x", "y", "valid_width", "valid_height"])
-            full_image[y : y + h, x : x + w] = image[:h, :w]
-            full_mask[y : y + h, x : x + w] = mask[:h, :w]
+
+            Image.fromarray(mask).save(masks_dir / name)
+            Image.fromarray(overlay(image, mask)).save(overlays_dir / name)
+
+            x = row["x"]
+            y = row["y"]
+            valid_width = row["valid_width"]
+            valid_height = row["valid_height"]
+
+            full_image[
+                y : y + valid_height,
+                x : x + valid_width,
+            ] = image[:valid_height, :valid_width]
+
+            full_mask[
+                y : y + valid_height,
+                x : x + valid_width,
+            ] = mask[:valid_height, :valid_width]
+
         stem = Path(source).stem
-        Image.fromarray(full_image).save(destinations[2] / f"{stem}_processed.png")
-        Image.fromarray(full_mask).save(destinations[2] / f"{stem}_mask.png")
-        Image.fromarray(overlay(full_image, full_mask)).save(
-            destinations[2] / f"{stem}_overlay.png"
+
+        Image.fromarray(full_image).save(
+            repatched_dir / f"{stem}_processed.png"
         )
-        print(f"Reconstructed {source}", flush=True)
-    print("Mask processing complete. Run validate.py and visually review the overlays.")
+        Image.fromarray(full_mask).save(
+            repatched_dir / f"{stem}_mask.png"
+        )
+        Image.fromarray(overlay(full_image, full_mask)).save(
+            repatched_dir / f"{stem}_overlay.png"
+        )
+
+        print(f"Reconstructed {source}")
+
+    print("Annotation processing complete.")
 
 
 if __name__ == "__main__":
